@@ -1,0 +1,546 @@
+import { firebaseConfig, emailjsConfig } from './config.js';
+import { openStore } from './store.js';
+import { newKeyPair, sealFor, openBox, sha256 } from './crypto.js';
+
+// ── Helfer ──────────────────────────────────────────────────────────────────
+const app = document.getElementById('app');
+const esc = (s) =>
+  String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+const ls = {
+  get(k, f = null) { try { const v = localStorage.getItem(k); return v == null ? f : JSON.parse(v); } catch { return f; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+  del(k) { try { localStorage.removeItem(k); } catch {} },
+};
+const ABC = 'abcdefghijkmnpqrstuvwxyz23456789';
+const rand = (n) => Array.from(crypto.getRandomValues(new Uint8Array(n)), (b) => ABC[b % ABC.length]).join('');
+const slug = (s) =>
+  s.toLowerCase().replace(/ä/g, 'ae').replace(/ö/g, 'oe').replace(/ü/g, 'ue').replace(/ß/g, 'ss')
+    .normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32) || 'wichteln';
+const isEmail = (s) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+const fmtDate = (d) => {
+  if (!d) return '';
+  const dt = new Date(d + 'T12:00:00');
+  return isNaN(dt) ? d : dt.toLocaleDateString('de-CH', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+};
+const nl2br = (s) => esc(s).replace(/\n/g, '<br>');
+
+const BASE = location.origin + location.pathname;
+const groupLink = (gid) => `${BASE}?g=${gid}`;
+const personalLink = (gid, me) => `${groupLink(gid)}#p=${me.mid}.${me.d}`;
+const adminLink = (gid, key) => `${groupLink(gid)}#admin=${key}`;
+const waLink = (text) => `https://wa.me/?text=${encodeURIComponent(text)}`;
+const mailLink = ({ to = '', bcc = '', subject, body }) =>
+  `mailto:${encodeURIComponent(to)}?${bcc ? `bcc=${encodeURIComponent(bcc)}&` : ''}subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+
+let toastTimer;
+function toast(msg, kind = 'ok') {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.dataset.kind = kind;
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (t.hidden = true), 3600);
+}
+
+// Neu zeichnen, ohne dass Eingaben, Fokus oder geöffnete Bereiche verloren gehen
+function paint(html) {
+  const vals = {};
+  app.querySelectorAll('input[id], textarea[id], select[id]').forEach((el) => {
+    if (!el.readOnly && el.type !== 'hidden') vals[el.id] = el.value;
+  });
+  const open = [...app.querySelectorAll('details[id]')].map((d) => [d.id, d.open]);
+  const active = document.activeElement;
+  const focusId = active?.id;
+  let sel = null;
+  try { sel = [active.selectionStart, active.selectionEnd]; } catch {}
+  app.innerHTML = html;
+  for (const [id, v] of Object.entries(vals)) {
+    const el = document.getElementById(id);
+    if (el && !el.readOnly) el.value = v;
+  }
+  for (const [id, o] of open) { const d = document.getElementById(id); if (d) d.open = o; }
+  if (focusId) {
+    const el = document.getElementById(focusId);
+    if (el) { el.focus({ preventScroll: true }); try { if (sel?.[0] != null) el.setSelectionRange(...sel); } catch {} }
+  }
+}
+
+function rememberGroup(gid, name) {
+  const list = ls.get('wichtel:groups', []).filter((g) => g.gid !== gid);
+  list.unshift({ gid, name });
+  ls.set('wichtel:groups', list.slice(0, 12));
+}
+
+async function sendMail(to_email, to_name, subject, message) {
+  if (!emailjsConfig) return false;
+  try {
+    const r = await fetch('https://api.emailjs.com/api/v1.0/email/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        service_id: emailjsConfig.serviceId,
+        template_id: emailjsConfig.templateId,
+        user_id: emailjsConfig.publicKey,
+        template_params: { to_email, to_name, subject, message },
+      }),
+    });
+    return r.ok;
+  } catch { return false; }
+}
+
+// Zufällige Zuteilung ohne Selbstbeschenkung und unter Beachtung der Ausschlüsse
+function derange(ids, exclusions) {
+  const bad = new Set(exclusions.flatMap(([a, b]) => [`${a}>${b}`, `${b}>${a}`]));
+  const rnd = (n) => crypto.getRandomValues(new Uint32Array(1))[0] % n;
+  for (let t = 0; t < 20000; t++) {
+    const r = ids.slice();
+    for (let i = r.length - 1; i > 0; i--) { const j = rnd(i + 1); [r[i], r[j]] = [r[j], r[i]]; }
+    if (ids.every((g, i) => r[i] !== g && !bad.has(`${g}>${r[i]}`))) return Object.fromEntries(ids.map((g, i) => [g, r[i]]));
+  }
+  return null;
+}
+
+const demoBanner = (store) =>
+  store.demo
+    ? `<div class="demo" role="note"><strong>Demo-Modus.</strong> Alles wird nur in diesem Browser gespeichert. Damit sich die Familie anmelden kann, Firebase in <code>config.js</code> eintragen (Anleitung im README).</div>`
+    : '';
+
+const store = await openStore(firebaseConfig);
+
+// ── Startseite: neue Runde erstellen ────────────────────────────────────────
+function renderHome() {
+  const known = ls.get('wichtel:groups', []);
+  const nextXmas = `${new Date().getMonth() === 11 && new Date().getDate() > 24 ? new Date().getFullYear() + 1 : new Date().getFullYear()}-12-24`;
+  paint(`
+    ${demoBanner(store)}
+    <header class="hero">
+      <p class="eyebrow">Wichteln · Familie</p>
+      <h1>Lose ziehen,<br>ohne Hut.</h1>
+      <p class="lede">Erstelle eine Wichtelrunde und schick den Link in den Familien-Chat. Alle melden sich mit ihrer E-Mail an. Nach der Auslosung sieht jede Person nur, wen sie selbst beschenkt.</p>
+    </header>
+
+    <ol class="steps">
+      <li><span>Runde erstellen</span><small>Name, Datum, Budget</small></li>
+      <li><span>Link per WhatsApp teilen</span><small>Alle tragen Namen &amp; E-Mail ein</small></li>
+      <li><span>Auslosen</span><small>Jedes Los ist verschlüsselt</small></li>
+    </ol>
+
+    <form class="card" data-form="create" autocomplete="off">
+      <h2>Neue Wichtelrunde</h2>
+      <label for="c-name">Name der Runde</label>
+      <input id="c-name" name="gname" required maxlength="60" placeholder="z. B. Familie Moser – Weihnachten ${new Date(nextXmas).getFullYear()}">
+      <div class="row">
+        <div><label for="c-date">Bescherung am</label><input id="c-date" name="date" type="date" value="${nextXmas}"></div>
+        <div><label for="c-budget">Budget pro Geschenk</label><div class="affix"><span>CHF</span><input id="c-budget" name="budget" inputmode="decimal" placeholder="30"></div></div>
+      </div>
+      <label for="c-note">Nachricht an alle <span class="opt">optional</span></label>
+      <textarea id="c-note" name="note" rows="3" maxlength="600" placeholder="Wir treffen uns bei Oma, Geschenke bitte eingepackt mitbringen."></textarea>
+      <button class="btn primary" type="submit">Runde erstellen</button>
+    </form>
+
+    ${known.length ? `
+      <section class="card quiet">
+        <h2>Deine Runden auf diesem Gerät</h2>
+        <ul class="known">${known.map((g) => `<li><a href="${esc(groupLink(g.gid))}">${esc(g.name)}</a></li>`).join('')}</ul>
+      </section>` : ''}
+  `);
+}
+
+async function createGroup(form) {
+  const f = form.elements;
+  const name = f.gname.value.trim();
+  if (!name) return toast('Bitte gib der Runde einen Namen.', 'err');
+  const key = rand(18);
+  const data = {
+    name,
+    date: f.date.value,
+    budget: f.budget.value.trim(),
+    note: f.note.value.trim(),
+    adminHash: await sha256(key),
+    createdAt: Date.now(),
+    members: {},
+    results: {},
+    exclusions: [],
+    drawnAt: null,
+    shortLink: '',
+  };
+  form.querySelector('button').disabled = true;
+  for (let i = 0; i < 4; i++) {
+    const id = `${slug(name)}-${rand(4)}`;
+    try {
+      await store.create(id, data);
+      ls.set(`wichtel:admin:${id}`, key);
+      rememberGroup(id, name);
+      location.href = `${groupLink(id)}#admin=${key}&neu=1`;
+      return;
+    } catch (e) {
+      if (e.message !== 'exists') {
+        form.querySelector('button').disabled = false;
+        return toast(`Speichern fehlgeschlagen: ${e.message}`, 'err');
+      }
+    }
+  }
+}
+
+// ── Wichtelrunde ────────────────────────────────────────────────────────────
+const S = { gid: null, g: null, me: null, adminKey: null, isAdmin: false, plain: null, plainCt: null, decryptErr: false, fresh: false, justJoined: false, confirm: null };
+
+async function initGroup(id) {
+  S.gid = id;
+  const h = new URLSearchParams(location.hash.slice(1));
+  const p = h.get('p');
+  if (p && p.includes('.')) { const [mid, d] = p.split('.'); ls.set(`wichtel:me:${id}`, { mid, d }); }
+  if (h.get('admin')) ls.set(`wichtel:admin:${id}`, h.get('admin'));
+  S.fresh = h.get('neu') === '1';
+  // Geheimnisse aus der Adresszeile entfernen, damit niemand versehentlich seinen Link weiterleitet
+  if (location.hash) history.replaceState(null, '', location.pathname + location.search);
+
+  S.me = ls.get(`wichtel:me:${id}`);
+  S.adminKey = ls.get(`wichtel:admin:${id}`);
+  paint(`${demoBanner(store)}<p class="loading">Wichtelrunde wird geladen…</p>`);
+
+  store.watch(id, async (g, err) => {
+    if (err) return paint(`<section class="card"><h2>Verbindung fehlgeschlagen</h2><p>${esc(err.message)}</p></section>`);
+    if (!g) return paint(`${demoBanner(store)}<section class="card"><h2>Diese Wichtelrunde gibt es nicht</h2><p>Prüfe den Link oder frag die Person, die dich eingeladen hat.</p><a class="btn" href="${esc(BASE)}">Eigene Runde erstellen</a></section>`);
+    S.g = g;
+    if (S.me && !g.members?.[S.me.mid]) { ls.del(`wichtel:me:${id}`); S.me = null; }
+    S.isAdmin = !!S.adminKey && (await sha256(S.adminKey)) === g.adminHash;
+    if (S.me || S.isAdmin) rememberGroup(id, g.name);
+    await decryptMine();
+    renderGroup();
+  });
+}
+
+async function decryptMine() {
+  const box = S.me && S.g.results?.[S.me.mid];
+  if (!box) { S.plain = null; S.plainCt = null; S.decryptErr = false; return; }
+  if (S.plainCt === box.ct) return;
+  try {
+    S.plain = await openBox(box, S.g.members[S.me.mid].pub, S.me.d);
+    S.decryptErr = false;
+  } catch {
+    S.plain = null;
+    S.decryptErr = true;
+  }
+  S.plainCt = box.ct;
+}
+
+function renderGroup() {
+  const g = S.g;
+  const members = Object.entries(g.members || {}).sort((a, b) => a[1].joinedAt - b[1].joinedAt);
+  const drawn = !!g.drawnAt;
+  document.title = `${g.name} · Wichteln`;
+  paint(`
+    ${demoBanner(store)}
+    <header class="group-head">
+      <p class="eyebrow">${drawn ? 'Ausgelost' : 'Anmeldung offen'}</p>
+      <h1>${esc(g.name)}</h1>
+      <dl class="facts">
+        ${g.date ? `<div><dt>Bescherung</dt><dd>${esc(fmtDate(g.date))}</dd></div>` : ''}
+        ${g.budget ? `<div><dt>Budget</dt><dd class="num">CHF ${esc(g.budget)}</dd></div>` : ''}
+        <div><dt>Dabei</dt><dd class="num">${members.length} ${members.length === 1 ? 'Person' : 'Personen'}</dd></div>
+      </dl>
+      ${g.note ? `<p class="note">${nl2br(g.note)}</p>` : ''}
+    </header>
+    ${S.isAdmin && S.fresh ? freshHtml() : ''}
+    ${S.me ? meHtml(g, drawn) : drawn ? lateHtml() : joinHtml()}
+    ${membersHtml(members)}
+    ${S.isAdmin ? adminHtml(g, members, drawn) : ''}
+    <footer class="foot"><a href="${esc(BASE)}">Eigene Wichtelrunde erstellen</a></footer>
+  `);
+}
+
+function freshHtml() {
+  return `
+    <section class="card callout">
+      <h2>Deine Runde steht</h2>
+      <p>Speichere zuerst deinen <strong>Admin-Link</strong>. Nur damit kannst du später auf einem anderen Gerät auslosen und Personen verwalten.</p>
+      <div class="linkbox"><input id="adm-link-fresh" readonly value="${esc(adminLink(S.gid, S.adminKey))}"><button class="btn" data-act="copy" data-text="${esc(adminLink(S.gid, S.adminKey))}">Kopieren</button></div>
+      <p class="hint">Danach unten bei <em>Organisation</em> den Einladungslink per WhatsApp teilen. Wenn du selbst mitmachst, melde dich gleich hier an.</p>
+      <button class="btn ghost" data-act="dismiss-fresh">Erledigt</button>
+    </section>`;
+}
+
+function joinHtml() {
+  return `
+    <form class="card" data-form="join" autocomplete="on">
+      <h2>Mach mit</h2>
+      <p class="sub">Trag dich ein. Nach der Auslosung erfährst du hier, wen du beschenkst.</p>
+      <label for="j-name">Dein Name</label>
+      <input id="j-name" name="who" required maxlength="40" autocomplete="given-name" placeholder="Vorname">
+      <label for="j-email">E-Mail</label>
+      <input id="j-email" name="email" type="email" required autocomplete="email" placeholder="name@beispiel.ch">
+      <label for="j-wish">Dein Wunschzettel <span class="opt">optional</span></label>
+      <textarea id="j-wish" name="wish" rows="3" maxlength="800" placeholder="Bücher von Martin Suter, warme Socken (Grösse 39), etwas Selbstgemachtes"></textarea>
+      <p class="hint">Den Wunschzettel sieht nur die Person, die dich zieht. Du kannst ihn später noch ändern.</p>
+      <button class="btn primary" type="submit">Anmelden</button>
+    </form>`;
+}
+
+function lateHtml() {
+  return `
+    <section class="card">
+      <h2>Die Lose sind schon gezogen</h2>
+      <p>Wenn du dich angemeldet hast, öffne deinen <strong>persönlichen Link</strong> aus der Anmelde-E-Mail. Auf diesem Gerät ist keine Anmeldung gespeichert.</p>
+    </section>`;
+}
+
+function personalLinkHtml(g, me, prominent) {
+  const link = personalLink(S.gid, me);
+  const text = `Mein persönlicher Wichtel-Link für „${g.name}“ (nicht weitergeben):\n${link}`;
+  const email = g.members[me.mid].email;
+  const inner = `
+      <p class="sub">Mit diesem Link siehst du nach der Auslosung deinen Wichtel, auch auf einem anderen Gerät. Er gehört nur dir. Bitte nicht in den Familien-Chat schicken.</p>
+      <div class="linkbox"><input id="me-link" readonly value="${esc(link)}"><button class="btn" data-act="copy" data-text="${esc(link)}">Kopieren</button></div>
+      <div class="actions">
+        ${emailjsConfig ? '' : `<a class="btn" href="${esc(mailLink({ to: email, subject: `Mein Wichtel-Link: ${g.name}`, body: text }))}">An mich mailen</a>`}
+        <a class="btn" href="${esc(waLink(text))}" target="_blank" rel="noopener">An mich per WhatsApp</a>
+      </div>`;
+  return prominent
+    ? `<div class="keep">${inner}</div>`
+    : `<details id="d-mylink" class="keep-fold"><summary>Mein persönlicher Link</summary>${inner}</details>`;
+}
+
+function meHtml(g, drawn) {
+  const m = g.members[S.me.mid];
+  let draw = '';
+  if (drawn && S.plain && g.members[S.plain]) {
+    const r = g.members[S.plain];
+    const revealed = ls.get(`wichtel:seen:${S.gid}:${S.plainCt}`, false);
+    draw = revealed
+      ? `<div class="lot open" aria-live="polite">
+           <p class="eyebrow">Du beschenkst</p>
+           <p class="lot-name">${esc(r.name)}</p>
+           <div class="wish"><h3>Wunschzettel von ${esc(r.name)}</h3>${r.wish ? `<p>${nl2br(r.wish)}</p>` : '<p class="muted">Noch keine Wünsche eingetragen. Schau später nochmals vorbei.</p>'}</div>
+           ${g.budget ? `<p class="hint">Budget: CHF ${esc(g.budget)}${g.date ? ` · Bescherung ${esc(fmtDate(g.date))}` : ''}</p>` : ''}
+         </div>`
+      : `<button class="lot closed" data-act="reveal"><span class="fold">Dein Los</span><span class="tap">Antippen zum Aufdecken</span></button>`;
+  } else if (drawn && S.decryptErr) {
+    draw = `<div class="card warn"><p>Dein Los liess sich auf diesem Gerät nicht öffnen. Öffne deinen persönlichen Link aus der Anmelde-E-Mail.</p></div>`;
+  } else if (drawn) {
+    draw = `<div class="card warn"><p>Du hast dich nach der Auslosung angemeldet. Bitte die Organisatorin oder den Organisator, nochmals auszulosen.</p></div>`;
+  }
+  return `
+    <section class="card me">
+      <div class="me-head">
+        <h2>${drawn ? `Hallo ${esc(m.name)}` : `Du bist dabei, ${esc(m.name)}`}</h2>
+        <button class="link-btn" data-act="logout">Nicht ${esc(m.name)}?</button>
+      </div>
+      ${drawn ? draw : `<p class="waiting">Die Lose sind noch nicht gezogen. Du bekommst Bescheid, sobald es so weit ist.</p>`}
+      ${S.justJoined ? personalLinkHtml(g, S.me, true) : ''}
+      <form data-form="wish" class="wish-form">
+        <label for="w-wish">Dein Wunschzettel</label>
+        <textarea id="w-wish" name="wish" rows="3" maxlength="800" placeholder="Was würde dich freuen?">${esc(m.wish || '')}</textarea>
+        <button class="btn" type="submit">Wunschzettel speichern</button>
+      </form>
+      ${S.justJoined ? '' : personalLinkHtml(g, S.me, false)}
+    </section>`;
+}
+
+function membersHtml(members) {
+  if (!members.length) return `<section class="card quiet"><h2>Noch niemand angemeldet</h2><p class="muted">Sobald sich jemand einträgt, erscheint der Name hier.</p></section>`;
+  return `
+    <section class="card quiet">
+      <h2>Wer ist dabei</h2>
+      <ul class="people">${members.map(([id, m]) => `<li${S.me?.mid === id ? ' class="self"' : ''}>${esc(m.name)}${S.me?.mid === id ? ' <small>(du)</small>' : ''}</li>`).join('')}</ul>
+    </section>`;
+}
+
+function adminHtml(g, members, drawn) {
+  const invite = g.shortLink || groupLink(S.gid);
+  const inviteText = `🎁 Wichteln: ${g.name}\n${g.date ? `Bescherung: ${fmtDate(g.date)}\n` : ''}${g.budget ? `Budget: CHF ${g.budget}\n` : ''}\nMelde dich hier mit deiner E-Mail an. Nach der Auslosung siehst du, wen du beschenkst:\n${invite}`;
+  const doneText = `🎁 ${g.name}: Die Lose sind gezogen!\nÖffne deinen persönlichen Link aus der Anmelde-Mail oder diese Seite auf dem Handy, mit dem du dich angemeldet hast:\n${invite}`;
+  const name = (id) => esc(g.members[id]?.name ?? '?');
+  const excl = (g.exclusions || []).filter(([a, b]) => g.members[a] && g.members[b]);
+  const opts = members.map(([id, m]) => `<option value="${id}">${esc(m.name)}</option>`).join('');
+  const emails = members.map(([, m]) => m.email);
+  const confirmDraw = S.confirm === 'redraw';
+  return `
+    <section class="card admin">
+      <p class="eyebrow">Nur für dich sichtbar</p>
+      <h2>Organisation</h2>
+
+      <h3>1 · Einladen</h3>
+      <div class="linkbox"><input id="inv-link" readonly value="${esc(invite)}"><button class="btn" data-act="copy" data-text="${esc(invite)}">Kopieren</button></div>
+      <div class="actions"><a class="btn wa" href="${esc(waLink(inviteText))}" target="_blank" rel="noopener">Per WhatsApp teilen</a></div>
+      <details id="d-short" class="fold">
+        <summary>Kurzen Link verwenden (Bitly)</summary>
+        <p class="sub">Erstelle auf <a href="https://bitly.com/" target="_blank" rel="noopener">bitly.com</a> einen kostenlosen Kurzlink für <span class="mono">${esc(groupLink(S.gid))}</span> und füge ihn hier ein. WhatsApp-Nachrichten verwenden dann den Kurzlink.</p>
+        <form data-form="short" class="inline">
+          <input id="s-link" name="short" type="url" placeholder="https://bit.ly/wichteln-moser" value="${esc(g.shortLink || '')}">
+          <button class="btn" type="submit">Speichern</button>
+        </form>
+      </details>
+
+      <h3>2 · Teilnehmende <span class="count">${members.length}</span></h3>
+      ${members.length ? `<ul class="roster">${members.map(([id, m]) => `
+        <li><span class="who">${esc(m.name)}</span><span class="mail">${esc(m.email)}</span>
+        ${drawn ? '' : S.confirm === `rm:${id}`
+          ? `<span class="confirm">Entfernen? <button class="link-btn danger" data-act="remove" data-mid="${id}">Ja</button> <button class="link-btn" data-act="cancel">Nein</button></span>`
+          : `<button class="link-btn" data-act="ask-remove" data-mid="${id}" aria-label="${esc(m.name)} entfernen">Entfernen</button>`}</li>`).join('')}</ul>`
+        : '<p class="muted">Noch niemand. Teile den Einladungslink.</p>'}
+
+      ${members.length >= 2 && !drawn ? `
+      <h3>3 · Ausschlüsse <span class="opt">optional</span></h3>
+      <p class="sub">Paare, die sich nicht gegenseitig ziehen sollen, zum Beispiel Ehepaare.</p>
+      <form data-form="excl" class="inline excl">
+        <select id="x-a" name="a" aria-label="Person A">${opts}</select>
+        <span aria-hidden="true">↔</span>
+        <select id="x-b" name="b" aria-label="Person B">${opts}</select>
+        <button class="btn" type="submit">Hinzufügen</button>
+      </form>` : ''}
+      ${excl.length ? `<ul class="chips">${excl.map(([a, b], i) => `<li>${name(a)} ↔ ${name(b)}${drawn ? '' : ` <button class="link-btn" data-act="del-excl" data-i="${i}" aria-label="Ausschluss entfernen">✕</button>`}</li>`).join('')}</ul>` : ''}
+
+      <h3>${members.length >= 2 && !drawn ? '4' : '3'} · Auslosen</h3>
+      ${drawn ? `
+        <p class="ok-line">Ausgelost am ${new Date(g.drawnAt).toLocaleString('de-CH', { dateStyle: 'medium', timeStyle: 'short' })}. Alle können jetzt ihr Los öffnen.</p>
+        <div class="actions">
+          <a class="btn wa" href="${esc(waLink(doneText))}" target="_blank" rel="noopener">Per WhatsApp Bescheid geben</a>
+          ${emailjsConfig
+            ? `<button class="btn" data-act="notify">Alle per E-Mail informieren</button>`
+            : `<a class="btn" href="${esc(mailLink({ bcc: emails.join(','), subject: `🎁 ${g.name}: Die Lose sind gezogen`, body: doneText }))}">Alle per E-Mail informieren</a>`}
+        </div>
+        ${confirmDraw
+          ? `<div class="confirm-box"><p>Neu auslosen macht alle bisherigen Lose ungültig. Wer schon nachgeschaut hat, bekommt eine neue Person.</p><div class="actions"><button class="btn danger" data-act="draw">Ja, neu auslosen</button><button class="btn ghost" data-act="cancel">Abbrechen</button></div></div>`
+          : `<button class="link-btn" data-act="ask-redraw">Neu auslosen (z. B. weil jemand dazugekommen ist)</button>`}
+        <button class="link-btn" data-act="reopen">Anmeldung wieder öffnen</button>`
+      : `
+        <p class="sub">${members.length < 3 ? `Es braucht mindestens 3 Personen. Noch ${3 - members.length}.` : 'Danach ist keine Anmeldung mehr möglich. Niemand, auch du nicht, kann die Zuteilung einsehen.'}</p>
+        <button class="btn primary" data-act="draw" ${members.length < 3 ? 'disabled' : ''}>Lose ziehen</button>`}
+
+      <details id="d-admin" class="fold">
+        <summary>Mein Admin-Link</summary>
+        <p class="sub">Damit verwaltest du die Runde auch auf einem anderen Gerät. Nicht weitergeben.</p>
+        <div class="linkbox"><input id="adm-link" readonly value="${esc(adminLink(S.gid, S.adminKey))}"><button class="btn" data-act="copy" data-text="${esc(adminLink(S.gid, S.adminKey))}">Kopieren</button></div>
+      </details>
+    </section>`;
+}
+
+// ── Aktionen ────────────────────────────────────────────────────────────────
+async function join(form) {
+  const f = form.elements;
+  const name = f.who.value.trim();
+  const email = f.email.value.trim().toLowerCase();
+  const wish = f.wish.value.trim();
+  if (!name) return toast('Bitte gib deinen Namen ein.', 'err');
+  if (!isEmail(email)) return toast('Diese E-Mail-Adresse sieht nicht richtig aus.', 'err');
+  if (S.g.drawnAt) return toast('Die Lose sind schon gezogen.', 'err');
+  if (Object.values(S.g.members).some((m) => m.email === email))
+    return toast('Diese E-Mail ist schon angemeldet. Öffne deinen persönlichen Link aus der Anmelde-Mail.', 'err');
+  form.querySelector('button[type=submit]').disabled = true;
+  const { pub, secret } = await newKeyPair();
+  const mid = rand(10);
+  try {
+    await store.update(S.gid, { [`members.${mid}`]: { name, email, wish, pub, joinedAt: Date.now() } });
+  } catch (e) {
+    form.querySelector('button[type=submit]').disabled = false;
+    return toast(`Anmeldung fehlgeschlagen: ${e.message}`, 'err');
+  }
+  S.me = { mid, d: secret };
+  S.justJoined = true;
+  ls.set(`wichtel:me:${S.gid}`, S.me);
+  rememberGroup(S.gid, S.g.name);
+  renderGroup();
+  const link = personalLink(S.gid, S.me);
+  const sent = await sendMail(email, name, `Du bist dabei: ${S.g.name}`,
+    `Hallo ${name}\n\nDu bist für „${S.g.name}“ angemeldet.${S.g.date ? `\nBescherung: ${fmtDate(S.g.date)}` : ''}${S.g.budget ? `\nBudget: CHF ${S.g.budget}` : ''}\n\nDein persönlicher Link (nicht weitergeben). Nach der Auslosung siehst du dort, wen du beschenkst:\n${link}`);
+  toast(sent ? 'Angemeldet. Dein persönlicher Link ist unterwegs in dein Postfach.' : 'Angemeldet. Speichere jetzt deinen persönlichen Link.');
+  document.querySelector('.keep')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+async function draw() {
+  const g = S.g;
+  const ids = Object.keys(g.members);
+  if (ids.length < 3) return toast('Es braucht mindestens 3 Personen.', 'err');
+  const map = derange(ids, g.exclusions || []);
+  if (!map) return toast('Mit diesen Ausschlüssen geht keine Auslosung auf. Entferne einen Ausschluss.', 'err');
+  const results = {};
+  for (const giver of ids) results[giver] = await sealFor(g.members[giver].pub, map[giver]);
+  S.confirm = null;
+  await store.update(S.gid, { results, drawnAt: Date.now() });
+  toast('Die Lose sind gezogen.');
+}
+
+async function notifyAll() {
+  const g = S.g;
+  const invite = g.shortLink || groupLink(S.gid);
+  let ok = 0;
+  const all = Object.values(g.members);
+  for (const m of all) {
+    if (await sendMail(m.email, m.name, `🎁 ${g.name}: Die Lose sind gezogen`,
+      `Hallo ${m.name}\n\nDie Lose für „${g.name}“ sind gezogen. Öffne deinen persönlichen Link aus der Anmelde-Mail, um zu sehen, wen du beschenkst. Auf dem Gerät, mit dem du dich angemeldet hast, geht auch dieser Link:\n${invite}`)) ok++;
+  }
+  toast(`${ok} von ${all.length} E-Mails verschickt.`, ok === all.length ? 'ok' : 'err');
+}
+
+async function copy(text) {
+  try { await navigator.clipboard.writeText(text); toast('Kopiert.'); }
+  catch { toast('Kopieren nicht möglich. Bitte den Link markieren und kopieren.', 'err'); }
+}
+
+const actions = {
+  copy: (el) => copy(el.dataset.text),
+  reveal: () => { ls.set(`wichtel:seen:${S.gid}:${S.plainCt}`, true); renderGroup(); },
+  logout: () => { ls.del(`wichtel:me:${S.gid}`); S.me = null; S.justJoined = false; renderGroup(); },
+  'dismiss-fresh': () => { S.fresh = false; renderGroup(); },
+  'ask-remove': (el) => { S.confirm = `rm:${el.dataset.mid}`; renderGroup(); },
+  'ask-redraw': () => { S.confirm = 'redraw'; renderGroup(); },
+  cancel: () => { S.confirm = null; renderGroup(); },
+  remove: async (el) => {
+    const mid = el.dataset.mid;
+    S.confirm = null;
+    await store.update(S.gid, {
+      [`members.${mid}`]: store.DEL,
+      exclusions: (S.g.exclusions || []).filter((p) => !p.includes(mid)),
+    });
+    toast('Entfernt.');
+  },
+  'del-excl': async (el) => {
+    const list = (S.g.exclusions || []).filter(([a, b]) => S.g.members[a] && S.g.members[b]);
+    list.splice(Number(el.dataset.i), 1);
+    await store.update(S.gid, { exclusions: list });
+  },
+  draw: () => draw(),
+  notify: () => notifyAll(),
+  reopen: async () => { await store.update(S.gid, { drawnAt: null, results: {} }); toast('Anmeldung ist wieder offen. Lose später neu ziehen.'); },
+};
+
+const forms = {
+  create: createGroup,
+  join,
+  wish: async (form) => {
+    await store.update(S.gid, { [`members.${S.me.mid}.wish`]: form.elements.wish.value.trim() });
+    toast('Wunschzettel gespeichert.');
+  },
+  short: async (form) => {
+    const v = form.elements.short.value.trim();
+    if (v && !/^https?:\/\//.test(v)) return toast('Bitte den ganzen Link mit https:// einfügen.', 'err');
+    await store.update(S.gid, { shortLink: v });
+    toast(v ? 'Kurzlink gespeichert.' : 'Kurzlink entfernt.');
+  },
+  excl: async (form) => {
+    const a = form.elements.a.value, b = form.elements.b.value;
+    if (a === b) return toast('Bitte zwei verschiedene Personen wählen.', 'err');
+    const list = S.g.exclusions || [];
+    if (list.some(([x, y]) => (x === a && y === b) || (x === b && y === a))) return toast('Diesen Ausschluss gibt es schon.', 'err');
+    await store.update(S.gid, { exclusions: [...list, [a, b]] });
+  },
+};
+
+app.addEventListener('click', async (e) => {
+  const el = e.target.closest('[data-act]');
+  if (!el || el.disabled) return;
+  e.preventDefault();
+  try { await actions[el.dataset.act]?.(el); } catch (err) { toast(`Das hat nicht geklappt: ${err.message}`, 'err'); }
+});
+app.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  try { await forms[e.target.dataset.form]?.(e.target); } catch (err) { toast(`Das hat nicht geklappt: ${err.message}`, 'err'); }
+});
+
+// ── Start ───────────────────────────────────────────────────────────────────
+const gid = new URLSearchParams(location.search).get('g');
+if (!gid) renderHome();
+else initGroup(gid);
+// Persönlicher Link in einem schon offenen Tab geöffnet → neu laden, damit er übernommen wird
+window.addEventListener('hashchange', () => location.hash && location.reload());

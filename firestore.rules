@@ -1,0 +1,23 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Eine Wichtelrunde = ein Dokument. Wer die (zufällige) ID kennt, kann sie lesen und sich anmelden.
+    // Runden können nicht aufgelistet werden; die Auslosung ist pro Person verschlüsselt.
+    match /wichtel/{gid} {
+      allow get: if true;
+      allow list: if false;
+      allow create: if request.resource.data.keys().hasAll(['name', 'adminHash', 'members', 'results'])
+                    && request.resource.data.members.size() == 0
+                    && request.resource.data.results.size() == 0
+                    && request.resource.data.name is string
+                    && request.resource.data.name.size() <= 60;
+      allow update: if request.resource.data.adminHash == resource.data.adminHash
+                    && request.resource.data.createdAt == resource.data.createdAt
+                    && request.resource.data.members.size() <= 100;
+      allow delete: if false;
+    }
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
