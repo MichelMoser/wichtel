@@ -225,10 +225,38 @@ async function decryptMine() {
   S.plainCt = box.ct;
 }
 
+// Gästeliste ↔ Anmeldungen: zuerst über guestId, sonst über den gleichen Namen
+// (so werden auch Personen erkannt, die sich vor dem Anlegen der Liste angemeldet haben)
+function guestMatches(g) {
+  const members = Object.entries(g.members || {});
+  const norm = (s) => String(s).trim().toLowerCase();
+  const used = new Set();
+  const map = {};
+  for (const gu of g.guests || []) {
+    const hit = members.find(([, m]) => m.guestId === gu.id);
+    if (hit) { map[gu.id] = hit[0]; used.add(hit[0]); }
+  }
+  for (const gu of g.guests || []) {
+    if (map[gu.id]) continue;
+    const hit = members.find(([id, m]) => !used.has(id) && !m.guestId && norm(m.name) === norm(gu.name));
+    if (hit) { map[gu.id] = hit[0]; used.add(hit[0]); }
+  }
+  return map;
+}
+
+function syncJoin() {
+  const sel = document.getElementById('j-guest');
+  const wrap = document.getElementById('j-name-wrap');
+  if (sel && wrap) wrap.hidden = sel.value !== 'other';
+}
+
 function renderGroup() {
   const g = S.g;
   const members = Object.entries(g.members || {}).sort((a, b) => a[1].joinedAt - b[1].joinedAt);
   const drawn = !!g.drawnAt;
+  const guests = g.guests || [];
+  const match = guestMatches(g);
+  const claimed = guests.filter((gu) => match[gu.id]).length;
   document.title = `${g.name} · Wichteln`;
   paint(`
     ${demoBanner(store)}
@@ -238,16 +266,17 @@ function renderGroup() {
       <dl class="facts">
         ${g.date ? `<div><dt>Bescherung</dt><dd>${esc(fmtDate(g.date))}</dd></div>` : ''}
         ${g.budget ? `<div><dt>Budget</dt><dd class="num">CHF ${esc(g.budget)}</dd></div>` : ''}
-        <div><dt>Dabei</dt><dd class="num">${members.length} ${members.length === 1 ? 'Person' : 'Personen'}</dd></div>
+        <div><dt>Dabei</dt><dd class="num">${guests.length ? `${claimed} von ${guests.length} angemeldet` : `${members.length} ${members.length === 1 ? 'Person' : 'Personen'}`}</dd></div>
       </dl>
       ${g.note ? `<p class="note">${nl2br(g.note)}</p>` : ''}
     </header>
     ${S.isAdmin && S.fresh ? freshHtml() : ''}
-    ${S.me ? meHtml(g, drawn) : drawn ? lateHtml() : joinHtml()}
-    ${membersHtml(members)}
-    ${S.isAdmin ? adminHtml(g, members, drawn) : ''}
+    ${S.me ? meHtml(g, drawn) : drawn ? lateHtml() : joinHtml(g, match)}
+    ${membersHtml(g, members, match)}
+    ${S.isAdmin ? adminHtml(g, members, drawn, match) : ''}
     <footer class="foot"><a href="${esc(BASE)}">Eigene Wichtelrunde erstellen</a></footer>
   `);
+  syncJoin();
 }
 
 function freshHtml() {
@@ -261,13 +290,24 @@ function freshHtml() {
     </section>`;
 }
 
-function joinHtml() {
+function joinHtml(g, match) {
+  const guests = g.guests || [];
+  const open = guests.filter((gu) => !match[gu.id]);
   return `
     <form class="card" data-form="join" autocomplete="on">
       <h2>Mach mit</h2>
       <p class="sub">Trag dich ein. Nach der Auslosung erfährst du hier, wen du beschenkst.</p>
-      <label for="j-name">Dein Name</label>
-      <input id="j-name" name="who" required maxlength="40" autocomplete="given-name" placeholder="Vorname">
+      ${guests.length ? `
+      <label for="j-guest">Wer bist du?</label>
+      <select id="j-guest" name="guest">
+        <option value="">Bitte wählen…</option>
+        ${open.map((gu) => `<option value="${gu.id}">${esc(gu.name)}</option>`).join('')}
+        <option value="other">Ich stehe nicht auf der Liste</option>
+      </select>` : ''}
+      <div id="j-name-wrap" class="field"${guests.length ? ' hidden' : ''}>
+        <label for="j-name">Dein Name</label>
+        <input id="j-name" name="who" maxlength="40" autocomplete="given-name" placeholder="Vorname">
+      </div>
       <label for="j-email">E-Mail</label>
       <input id="j-email" name="email" type="email" required autocomplete="email" placeholder="name@beispiel.ch">
       <label for="j-wish">Dein Wunschzettel <span class="opt">optional</span></label>
@@ -337,30 +377,85 @@ function meHtml(g, drawn) {
     </section>`;
 }
 
-function membersHtml(members) {
-  if (!members.length) return `<section class="card quiet"><h2>Noch niemand angemeldet</h2><p class="muted">Sobald sich jemand einträgt, erscheint der Name hier.</p></section>`;
+function membersHtml(g, members, match) {
+  const guests = g.guests || [];
+  if (!members.length && !guests.length) return `<section class="card quiet"><h2>Noch niemand angemeldet</h2><p class="muted">Sobald sich jemand einträgt, erscheint der Name hier.</p></section>`;
+  const chip = (name, mid) => {
+    const self = mid && S.me?.mid === mid;
+    return `<li class="${mid ? '' : 'pending'}${self ? ' self' : ''}">${esc(name)}${self ? ' <small>(du)</small>' : mid ? '' : ' <small>offen</small>'}</li>`;
+  };
+  const matched = new Set(Object.values(match));
+  const extras = members.filter(([id]) => !matched.has(id));
+  const open = guests.filter((gu) => !match[gu.id]).length;
   return `
     <section class="card quiet">
       <h2>Wer ist dabei</h2>
-      <ul class="people">${members.map(([id, m]) => `<li${S.me?.mid === id ? ' class="self"' : ''}>${esc(m.name)}${S.me?.mid === id ? ' <small>(du)</small>' : ''}</li>`).join('')}</ul>
+      ${guests.length && !g.drawnAt ? `<p class="sub">${open ? `Noch ${open} ${open === 1 ? 'Person' : 'Personen'} offen.` : 'Alle auf der Liste sind angemeldet.'}</p>` : ''}
+      <ul class="people">
+        ${guests.map((gu) => chip(gu.name, match[gu.id])).join('')}
+        ${extras.map(([id, m]) => chip(m.name, id)).join('')}
+      </ul>
     </section>`;
 }
 
-function adminHtml(g, members, drawn) {
+function guestsAdminHtml(g, drawn, match, invite) {
+  const guests = g.guests || [];
+  const proxies = ls.get(`wichtel:proxy:${S.gid}`, {});
+  const missing = guests.filter((gu) => !match[gu.id]);
+  const remind = `🎁 ${g.name}: Noch nicht angemeldet ${missing.length === 1 ? 'ist' : 'sind'} ${missing.map((gu) => gu.name).join(', ')}. Bitte hier eintragen:\n${invite}`;
+  const row = (gu) => {
+    const mid = match[gu.id];
+    const m = mid && g.members[mid];
+    const proxy = mid && proxies[mid];
+    let actions = '';
+    if (proxy) {
+      const link = personalLink(S.gid, { mid, d: proxy });
+      const text = `Hallo ${gu.name}, ich habe dich für „${g.name}“ angemeldet. Das ist dein persönlicher Wichtel-Link (nicht weitergeben). Nach der Auslosung siehst du dort, wen du beschenkst:\n${link}`;
+      actions = `<span class="row-actions"><button class="link-btn" data-act="copy" data-text="${esc(link)}">Link kopieren</button><a class="link-btn" href="${esc(waLink(text))}" target="_blank" rel="noopener">Per WhatsApp</a></span>`;
+    } else if (!mid && !drawn) {
+      actions = `<span class="row-actions"><button class="link-btn" data-act="ask-behalf" data-guest="${gu.id}">Für ${esc(gu.name)} anmelden</button><button class="link-btn" data-act="del-guest" data-guest="${gu.id}" aria-label="${esc(gu.name)} von der Liste nehmen">Entfernen</button></span>`;
+    }
+    const form = S.confirm === `behalf:${gu.id}` ? `
+      <form data-form="behalf" data-guest="${gu.id}" class="behalf">
+        <p class="sub">Für Personen ohne Handy oder WhatsApp. Du bekommst den persönlichen Link und gibst ihn weiter.</p>
+        <label for="b-email">E-Mail von ${esc(gu.name)} <span class="opt">optional</span></label>
+        <input id="b-email" name="email" type="email" placeholder="name@beispiel.ch">
+        <label for="b-wish">Wunschzettel <span class="opt">optional</span></label>
+        <textarea id="b-wish" name="wish" rows="2" maxlength="800"></textarea>
+        <div class="actions"><button class="btn primary" type="submit">${esc(gu.name)} anmelden</button><button class="btn ghost" data-act="cancel">Abbrechen</button></div>
+      </form>` : '';
+    return `<li><span class="who">${esc(gu.name)}</span><span class="mail">${m ? (proxy ? 'von dir angemeldet' : `angemeldet${m.email ? ` · ${esc(m.email)}` : ''}`) : 'noch nicht angemeldet'}</span>${actions}${form}</li>`;
+  };
+  return `
+      <p class="sub">Wer an Weihnachten dabei ist. Alle wählen bei der Anmeldung ihren Namen, und du siehst, wer noch fehlt.</p>
+      ${guests.length ? `<ul class="roster guests">${guests.map(row).join('')}</ul>` : ''}
+      ${drawn ? '' : `
+      <form data-form="guests" class="guest-add">
+        <label for="g-names">Namen hinzufügen <span class="opt">einer pro Zeile</span></label>
+        <textarea id="g-names" name="names" rows="3" placeholder="Oma Rosmarie&#10;Opa Walter&#10;Anna"></textarea>
+        <button class="btn" type="submit">Zur Gästeliste hinzufügen</button>
+      </form>`}
+      ${missing.length && !drawn && guests.length > missing.length ? `<div class="actions"><a class="btn wa" href="${esc(waLink(remind))}" target="_blank" rel="noopener">Fehlende per WhatsApp erinnern</a></div>` : ''}`;
+}
+
+function adminHtml(g, members, drawn, match) {
   const invite = g.shortLink || groupLink(S.gid);
   const inviteText = `🎁 Wichteln: ${g.name}\n${g.date ? `Bescherung: ${fmtDate(g.date)}\n` : ''}${g.budget ? `Budget: CHF ${g.budget}\n` : ''}\nMelde dich hier mit deiner E-Mail an. Nach der Auslosung siehst du, wen du beschenkst:\n${invite}`;
   const doneText = `🎁 ${g.name}: Die Lose sind gezogen!\nÖffne deinen persönlichen Link aus der Anmelde-Mail oder diese Seite auf dem Handy, mit dem du dich angemeldet hast:\n${invite}`;
   const name = (id) => esc(g.members[id]?.name ?? '?');
   const excl = (g.exclusions || []).filter(([a, b]) => g.members[a] && g.members[b]);
   const opts = members.map(([id, m]) => `<option value="${id}">${esc(m.name)}</option>`).join('');
-  const emails = members.map(([, m]) => m.email);
+  const emails = members.map(([, m]) => m.email).filter(Boolean);
   const confirmDraw = S.confirm === 'redraw';
+  const missing = (g.guests || []).filter((gu) => !match[gu.id]);
+  let n = 0;
+  const step = (t) => `${++n} · ${t}`;
   return `
     <section class="card admin">
       <p class="eyebrow">Nur für dich sichtbar</p>
       <h2>Organisation</h2>
 
-      <h3>1 · Einladen</h3>
+      <h3>${step('Einladen')}</h3>
       <div class="linkbox"><input id="inv-link" readonly value="${esc(invite)}"><button class="btn" data-act="copy" data-text="${esc(invite)}">Kopieren</button></div>
       <div class="actions"><a class="btn wa" href="${esc(waLink(inviteText))}" target="_blank" rel="noopener">Per WhatsApp teilen</a></div>
       <details id="d-short" class="fold">
@@ -372,16 +467,19 @@ function adminHtml(g, members, drawn) {
         </form>
       </details>
 
-      <h3>2 · Teilnehmende <span class="count">${members.length}</span></h3>
+      <h3>${step('Gästeliste')} ${(g.guests || []).length ? `<span class="count">${(g.guests || []).length - missing.length}/${(g.guests || []).length}</span>` : '<span class="opt">optional</span>'}</h3>
+      ${guestsAdminHtml(g, drawn, match, invite)}
+
+      <h3>${step('Teilnehmende')} <span class="count">${members.length}</span></h3>
       ${members.length ? `<ul class="roster">${members.map(([id, m]) => `
-        <li><span class="who">${esc(m.name)}</span><span class="mail">${esc(m.email)}</span>
+        <li><span class="who">${esc(m.name)}</span><span class="mail">${esc(m.email || 'ohne E-Mail')}</span>
         ${drawn ? '' : S.confirm === `rm:${id}`
           ? `<span class="confirm">Entfernen? <button class="link-btn danger" data-act="remove" data-mid="${id}">Ja</button> <button class="link-btn" data-act="cancel">Nein</button></span>`
           : `<button class="link-btn" data-act="ask-remove" data-mid="${id}" aria-label="${esc(m.name)} entfernen">Entfernen</button>`}</li>`).join('')}</ul>`
         : '<p class="muted">Noch niemand. Teile den Einladungslink.</p>'}
 
       ${members.length >= 2 && !drawn ? `
-      <h3>3 · Ausschlüsse <span class="opt">optional</span></h3>
+      <h3>${step('Ausschlüsse')} <span class="opt">optional</span></h3>
       <p class="sub">Paare, die sich nicht gegenseitig ziehen sollen, zum Beispiel Ehepaare.</p>
       <form data-form="excl" class="inline excl">
         <select id="x-a" name="a" aria-label="Person A">${opts}</select>
@@ -391,7 +489,7 @@ function adminHtml(g, members, drawn) {
       </form>` : ''}
       ${excl.length ? `<ul class="chips">${excl.map(([a, b], i) => `<li>${name(a)} ↔ ${name(b)}${drawn ? '' : ` <button class="link-btn" data-act="del-excl" data-i="${i}" aria-label="Ausschluss entfernen">✕</button>`}</li>`).join('')}</ul>` : ''}
 
-      <h3>${members.length >= 2 && !drawn ? '4' : '3'} · Auslosen</h3>
+      <h3>${step('Auslosen')}</h3>
       ${drawn ? `
         <p class="ok-line">Ausgelost am ${new Date(g.drawnAt).toLocaleString('de-CH', { dateStyle: 'medium', timeStyle: 'short' })}. Alle können jetzt ihr Los öffnen.</p>
         <div class="actions">
@@ -405,8 +503,10 @@ function adminHtml(g, members, drawn) {
           : `<button class="link-btn" data-act="ask-redraw">Neu auslosen (z. B. weil jemand dazugekommen ist)</button>`}
         <button class="link-btn" data-act="reopen">Anmeldung wieder öffnen</button>`
       : `
-        <p class="sub">${members.length < 3 ? `Es braucht mindestens 3 Personen. Noch ${3 - members.length}.` : 'Danach ist keine Anmeldung mehr möglich. Niemand, auch du nicht, kann die Zuteilung einsehen.'}</p>
-        <button class="btn primary" data-act="draw" ${members.length < 3 ? 'disabled' : ''}>Lose ziehen</button>`}
+        <p class="sub">${members.length < 3 ? `Es braucht mindestens 3 Personen. Noch ${3 - members.length}.` : 'Danach ist keine Anmeldung mehr möglich. Die Zuteilung ist für jede Person einzeln verschlüsselt.'}</p>
+        ${S.confirm === 'draw-missing'
+          ? `<div class="confirm-box"><p>Noch nicht angemeldet: <strong>${missing.map((gu) => esc(gu.name)).join(', ')}</strong>. Wer jetzt fehlt, bekommt kein Los. Später dazunehmen geht nur mit einer neuen Auslosung für alle.</p><div class="actions"><button class="btn danger" data-act="draw">Trotzdem auslosen</button><button class="btn ghost" data-act="cancel">Abbrechen</button></div></div>`
+          : `<button class="btn primary" data-act="${missing.length ? 'ask-draw' : 'draw'}" ${members.length < 3 ? 'disabled' : ''}>Lose ziehen</button>`}`}
 
       <details id="d-admin" class="fold">
         <summary>Mein Admin-Link</summary>
@@ -419,7 +519,16 @@ function adminHtml(g, members, drawn) {
 // ── Aktionen ────────────────────────────────────────────────────────────────
 async function join(form) {
   const f = form.elements;
-  const name = f.who.value.trim();
+  const pick = f.guest?.value;
+  let name = f.who.value.trim();
+  let guestId = null;
+  if (f.guest && !pick) return toast('Bitte wähle deinen Namen aus der Liste.', 'err');
+  if (pick && pick !== 'other') {
+    const gu = (S.g.guests || []).find((x) => x.id === pick);
+    if (!gu || guestMatches(S.g)[gu.id]) return toast('Diese Person ist schon angemeldet.', 'err');
+    name = gu.name;
+    guestId = gu.id;
+  }
   const email = f.email.value.trim().toLowerCase();
   const wish = f.wish.value.trim();
   if (!name) return toast('Bitte gib deinen Namen ein.', 'err');
@@ -431,7 +540,7 @@ async function join(form) {
   const { pub, secret } = await newKeyPair();
   const mid = rand(10);
   try {
-    await store.update(S.gid, { [`members.${mid}`]: { name, email, wish, pub, joinedAt: Date.now() } });
+    await store.update(S.gid, { [`members.${mid}`]: { name, email, wish, pub, joinedAt: Date.now(), guestId } });
   } catch (e) {
     form.querySelector('button[type=submit]').disabled = false;
     return toast(`Anmeldung fehlgeschlagen: ${e.message}`, 'err');
@@ -465,7 +574,7 @@ async function notifyAll() {
   const g = S.g;
   const invite = g.shortLink || groupLink(S.gid);
   let ok = 0;
-  const all = Object.values(g.members);
+  const all = Object.values(g.members).filter((m) => m.email);
   for (const m of all) {
     if (await sendMail(m.email, m.name, `🎁 ${g.name}: Die Lose sind gezogen`,
       `Hallo ${m.name}\n\nDie Lose für „${g.name}“ sind gezogen. Öffne deinen persönlichen Link aus der Anmelde-Mail, um zu sehen, wen du beschenkst. Auf dem Gerät, mit dem du dich angemeldet hast, geht auch dieser Link:\n${invite}`)) ok++;
@@ -485,6 +594,11 @@ const actions = {
   'dismiss-fresh': () => { S.fresh = false; renderGroup(); },
   'ask-remove': (el) => { S.confirm = `rm:${el.dataset.mid}`; renderGroup(); },
   'ask-redraw': () => { S.confirm = 'redraw'; renderGroup(); },
+  'ask-draw': () => { S.confirm = 'draw-missing'; renderGroup(); },
+  'ask-behalf': (el) => { S.confirm = `behalf:${el.dataset.guest}`; renderGroup(); document.getElementById('b-email')?.focus(); },
+  'del-guest': async (el) => {
+    await store.update(S.gid, { guests: (S.g.guests || []).filter((gu) => gu.id !== el.dataset.guest) });
+  },
   cancel: () => { S.confirm = null; renderGroup(); },
   remove: async (el) => {
     const mid = el.dataset.mid;
@@ -518,6 +632,43 @@ const forms = {
     await store.update(S.gid, { shortLink: v });
     toast(v ? 'Kurzlink gespeichert.' : 'Kurzlink entfernt.');
   },
+  guests: async (form) => {
+    const list = S.g.guests || [];
+    const have = new Set(list.map((gu) => gu.name.toLowerCase()));
+    const add = [];
+    for (const raw of form.elements.names.value.split(/[\n,;]+/)) {
+      const name = raw.trim().slice(0, 40);
+      if (!name || have.has(name.toLowerCase())) continue;
+      have.add(name.toLowerCase());
+      add.push({ id: rand(6), name });
+    }
+    if (!add.length) return toast('Keine neuen Namen gefunden.', 'err');
+    if (list.length + add.length > 100) return toast('Die Gästeliste kann höchstens 100 Namen haben.', 'err');
+    await store.update(S.gid, { guests: [...list, ...add] });
+    document.getElementById('g-names').value = '';
+    toast(`${add.length} ${add.length === 1 ? 'Name' : 'Namen'} hinzugefügt.`);
+  },
+  behalf: async (form) => {
+    const gu = (S.g.guests || []).find((x) => x.id === form.dataset.guest);
+    if (!gu || guestMatches(S.g)[gu.id]) return toast('Diese Person ist schon angemeldet.', 'err');
+    if (S.g.drawnAt) return toast('Die Lose sind schon gezogen.', 'err');
+    const email = form.elements.email.value.trim().toLowerCase();
+    if (email && !isEmail(email)) return toast('Diese E-Mail-Adresse sieht nicht richtig aus.', 'err');
+    if (email && Object.values(S.g.members).some((m) => m.email === email)) return toast('Diese E-Mail ist schon angemeldet.', 'err');
+    const { pub, secret } = await newKeyPair();
+    const mid = rand(10);
+    // Den geheimen Schlüssel behält dein Browser, damit du den Link weitergeben kannst
+    const proxies = ls.get(`wichtel:proxy:${S.gid}`, {});
+    proxies[mid] = secret;
+    ls.set(`wichtel:proxy:${S.gid}`, proxies);
+    S.confirm = null;
+    await store.update(S.gid, {
+      [`members.${mid}`]: { name: gu.name, email, wish: form.elements.wish.value.trim(), pub, joinedAt: Date.now(), guestId: gu.id, byAdmin: true },
+    });
+    const sent = email && await sendMail(email, gu.name, `Du bist dabei: ${S.g.name}`,
+      `Hallo ${gu.name}\n\nDu wurdest für „${S.g.name}“ angemeldet.${S.g.date ? `\nBescherung: ${fmtDate(S.g.date)}` : ''}${S.g.budget ? `\nBudget: CHF ${S.g.budget}` : ''}\n\nDein persönlicher Link (nicht weitergeben). Nach der Auslosung siehst du dort, wen du beschenkst:\n${personalLink(S.gid, { mid, d: secret })}`);
+    toast(sent ? `${gu.name} ist angemeldet und hat den Link per E-Mail bekommen.` : `${gu.name} ist angemeldet. Gib den persönlichen Link weiter.`);
+  },
   excl: async (form) => {
     const a = form.elements.a.value, b = form.elements.b.value;
     if (a === b) return toast('Bitte zwei verschiedene Personen wählen.', 'err');
@@ -533,6 +684,7 @@ app.addEventListener('click', async (e) => {
   e.preventDefault();
   try { await actions[el.dataset.act]?.(el); } catch (err) { toast(`Das hat nicht geklappt: ${err.message}`, 'err'); }
 });
+app.addEventListener('change', (e) => { if (e.target.id === 'j-guest') syncJoin(); });
 app.addEventListener('submit', async (e) => {
   e.preventDefault();
   try { await forms[e.target.dataset.form]?.(e.target); } catch (err) { toast(`Das hat nicht geklappt: ${err.message}`, 'err'); }
