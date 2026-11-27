@@ -28,9 +28,11 @@ const BASE = location.origin + location.pathname;
 const groupLink = (gid) => `${BASE}?g=${gid}`;
 const personalLink = (gid, me) => `${groupLink(gid)}#p=${me.mid}.${me.d}`;
 const adminLink = (gid, key) => `${groupLink(gid)}#admin=${key}`;
+// Ohne EmailJS bekommt niemand eine Anmelde-Mail – dann auf den gespeicherten Link verweisen
+const LINK_FROM = emailjsConfig ? ' aus der Anmelde-Mail' : ', den du bei der Anmeldung gespeichert hast';
 const waLink = (text) => `https://wa.me/?text=${encodeURIComponent(text)}`;
 const mailLink = ({ to = '', bcc = '', subject, body }) =>
-  `mailto:${encodeURIComponent(to)}?${bcc ? `bcc=${encodeURIComponent(bcc)}&` : ''}subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  `mailto:${encodeURIComponent(to)}?${bcc ? `bcc=${bcc.split(',').map(encodeURIComponent).join(',')}&` : ''}subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
 
 let toastTimer;
 function toast(msg, kind = 'ok') {
@@ -321,7 +323,7 @@ function lateHtml() {
   return `
     <section class="card">
       <h2>Die Lose sind schon gezogen</h2>
-      <p>Wenn du dich angemeldet hast, öffne deinen <strong>persönlichen Link</strong> aus der Anmelde-E-Mail. Auf diesem Gerät ist keine Anmeldung gespeichert.</p>
+      <p>Wenn du dich angemeldet hast, öffne deinen <strong>persönlichen Link</strong>${LINK_FROM}. Auf diesem Gerät ist keine Anmeldung gespeichert.</p>
     </section>`;
 }
 
@@ -356,7 +358,7 @@ function meHtml(g, drawn) {
          </div>`
       : `<button class="lot closed" data-act="reveal"><span class="fold">Dein Los</span><span class="tap">Antippen zum Aufdecken</span></button>`;
   } else if (drawn && S.decryptErr) {
-    draw = `<div class="card warn"><p>Dein Los liess sich auf diesem Gerät nicht öffnen. Öffne deinen persönlichen Link aus der Anmelde-E-Mail.</p></div>`;
+    draw = `<div class="card warn"><p>Dein Los liess sich auf diesem Gerät nicht öffnen. Öffne deinen persönlichen Link${LINK_FROM}.</p></div>`;
   } else if (drawn) {
     draw = `<div class="card warn"><p>Du hast dich nach der Auslosung angemeldet. Bitte die Organisatorin oder den Organisator, nochmals auszulosen.</p></div>`;
   }
@@ -441,7 +443,7 @@ function guestsAdminHtml(g, drawn, match, invite) {
 function adminHtml(g, members, drawn, match) {
   const invite = g.shortLink || groupLink(S.gid);
   const inviteText = `🎁 Wichteln: ${g.name}\n${g.date ? `Bescherung: ${fmtDate(g.date)}\n` : ''}${g.budget ? `Budget: CHF ${g.budget}\n` : ''}\nMelde dich hier mit deiner E-Mail an. Nach der Auslosung siehst du, wen du beschenkst:\n${invite}`;
-  const doneText = `🎁 ${g.name}: Die Lose sind gezogen!\nÖffne deinen persönlichen Link aus der Anmelde-Mail oder diese Seite auf dem Handy, mit dem du dich angemeldet hast:\n${invite}`;
+  const doneText = `🎁 ${g.name}: Die Lose sind gezogen!\nÖffne diese Seite auf dem Handy, mit dem du dich angemeldet hast, oder deinen persönlichen Link${LINK_FROM}:\n${invite}`;
   const name = (id) => esc(g.members[id]?.name ?? '?');
   const excl = (g.exclusions || []).filter(([a, b]) => g.members[a] && g.members[b]);
   const opts = members.map(([id, m]) => `<option value="${id}">${esc(m.name)}</option>`).join('');
@@ -535,7 +537,7 @@ async function join(form) {
   if (!isEmail(email)) return toast('Diese E-Mail-Adresse sieht nicht richtig aus.', 'err');
   if (S.g.drawnAt) return toast('Die Lose sind schon gezogen.', 'err');
   if (Object.values(S.g.members).some((m) => m.email === email))
-    return toast('Diese E-Mail ist schon angemeldet. Öffne deinen persönlichen Link aus der Anmelde-Mail.', 'err');
+    return toast(`Diese E-Mail ist schon angemeldet. Öffne deinen persönlichen Link${LINK_FROM}.`, 'err');
   form.querySelector('button[type=submit]').disabled = true;
   const { pub, secret } = await newKeyPair();
   const mid = rand(10);
