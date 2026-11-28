@@ -324,6 +324,8 @@ function lateHtml() {
     <section class="card">
       <h2>Die Lose sind schon gezogen</h2>
       <p>Wenn du dich angemeldet hast, öffne deinen <strong>persönlichen Link</strong>${LINK_FROM}. Auf diesem Gerät ist keine Anmeldung gespeichert.</p>
+      <p class="hint">Tipp: Öffne den Link im gleichen Browser wie bei der Anmeldung. Aus WhatsApp heraus öffnet sich oft ein anderer Browser. Tippe dann auf „Im Browser öffnen“ oder kopiere den Link nach Safari bzw. Chrome.</p>
+      <p class="hint">Link verloren? Melde dich bei der Person, die die Runde organisiert. Sie kann dir einen neuen Link schicken.</p>
     </section>`;
 }
 
@@ -440,6 +442,30 @@ function guestsAdminHtml(g, drawn, match, invite) {
       ${missing.length && !drawn && guests.length > missing.length ? `<div class="actions"><a class="btn wa" href="${esc(waLink(remind))}" target="_blank" rel="noopener">Fehlende per WhatsApp erinnern</a></div>` : ''}`;
 }
 
+function participantRow(g, id, m, drawn) {
+  const proxy = ls.get(`wichtel:proxy:${S.gid}`, {})[id];
+  const own = S.me?.mid === id;
+  let actions;
+  if (S.confirm === `rm:${id}`) {
+    actions = `<span class="confirm">Entfernen? <button class="link-btn danger" data-act="remove" data-mid="${id}">Ja</button> <button class="link-btn" data-act="cancel">Nein</button></span>`;
+  } else {
+    const link = proxy && personalLink(S.gid, { mid: id, d: proxy });
+    const text = link && `Hallo ${m.name}, hier ist dein persönlicher Wichtel-Link für „${g.name}“ (nicht weitergeben). Dort siehst du${drawn ? '' : ' nach der Auslosung'}, wen du beschenkst:\n${link}`;
+    actions = `<span class="row-actions">
+      ${link ? `<button class="link-btn" data-act="copy" data-text="${esc(link)}">Link kopieren</button><a class="link-btn" href="${esc(waLink(text))}" target="_blank" rel="noopener">Per WhatsApp</a>` : ''}
+      ${own ? '' : `<button class="link-btn" data-act="ask-relink" data-mid="${id}">Neuer Link</button>`}
+      ${drawn ? '' : `<button class="link-btn" data-act="ask-remove" data-mid="${id}" aria-label="${esc(m.name)} entfernen">Entfernen</button>`}
+    </span>`;
+  }
+  const confirm = S.confirm === `relink:${id}` ? `
+    <div class="behalf">
+      <p>Neuen persönlichen Link für <strong>${esc(m.name)}</strong> erstellen? Der alte Link funktioniert danach nicht mehr. Weil der neue Link bei dir entsteht, könntest du damit auch das Los von ${esc(m.name)} sehen.</p>
+      ${drawn ? `<p class="warn-line">Die Lose sind schon gezogen. Das Los von ${esc(m.name)} lässt sich mit dem neuen Link erst nach einer <strong>neuen Auslosung</strong> öffnen. Dabei bekommen alle eine neue Person. Erstelle zuerst alle nötigen neuen Links und lose dann einmal neu aus.</p>` : ''}
+      <div class="actions"><button class="btn primary" data-act="relink" data-mid="${id}">Neuen Link erstellen</button><button class="btn ghost" data-act="cancel">Abbrechen</button></div>
+    </div>` : '';
+  return `<li><span class="who">${esc(m.name)}${own ? ' <small>(du)</small>' : ''}</span><span class="mail">${esc(m.email || 'ohne E-Mail')}${m.relinkedAt && g.drawnAt && m.relinkedAt > g.drawnAt ? ' · <strong class="warn-text">neuer Link, braucht neue Auslosung</strong>' : ''}</span>${actions}${confirm}</li>`;
+}
+
 function adminHtml(g, members, drawn, match) {
   const invite = g.shortLink || groupLink(S.gid);
   const inviteText = `🎁 Wichteln: ${g.name}\n${g.date ? `Bescherung: ${fmtDate(g.date)}\n` : ''}${g.budget ? `Budget: CHF ${g.budget}\n` : ''}\nMelde dich hier mit deiner E-Mail an. Nach der Auslosung siehst du, wen du beschenkst:\n${invite}`;
@@ -473,11 +499,8 @@ function adminHtml(g, members, drawn, match) {
       ${guestsAdminHtml(g, drawn, match, invite)}
 
       <h3>${step('Teilnehmende')} <span class="count">${members.length}</span></h3>
-      ${members.length ? `<ul class="roster">${members.map(([id, m]) => `
-        <li><span class="who">${esc(m.name)}</span><span class="mail">${esc(m.email || 'ohne E-Mail')}</span>
-        ${drawn ? '' : S.confirm === `rm:${id}`
-          ? `<span class="confirm">Entfernen? <button class="link-btn danger" data-act="remove" data-mid="${id}">Ja</button> <button class="link-btn" data-act="cancel">Nein</button></span>`
-          : `<button class="link-btn" data-act="ask-remove" data-mid="${id}" aria-label="${esc(m.name)} entfernen">Entfernen</button>`}</li>`).join('')}</ul>`
+      ${members.length ? `<p class="sub">Hat jemand den persönlichen Link verloren? Mit <em>Neuer Link</em> erstellst du einen neuen und schickst ihn weiter.</p>
+      <ul class="roster">${members.map(([id, m]) => participantRow(g, id, m, drawn)).join('')}</ul>`
         : '<p class="muted">Noch niemand. Teile den Einladungslink.</p>'}
 
       ${members.length >= 2 && !drawn ? `
@@ -494,6 +517,7 @@ function adminHtml(g, members, drawn, match) {
       <h3>${step('Auslosen')}</h3>
       ${drawn ? `
         <p class="ok-line">Ausgelost am ${new Date(g.drawnAt).toLocaleString('de-CH', { dateStyle: 'medium', timeStyle: 'short' })}. Alle können jetzt ihr Los öffnen.</p>
+        ${members.some(([, m]) => m.relinkedAt > g.drawnAt) ? `<p class="warn-line">Neue Links für ${members.filter(([, m]) => m.relinkedAt > g.drawnAt).map(([, m]) => esc(m.name)).join(', ')}. Diese Lose öffnen sich erst nach einer neuen Auslosung. Tippe unten auf <em>Neu auslosen</em>, sobald alle neuen Links erstellt sind.</p>` : ''}
         <div class="actions">
           <a class="btn wa" href="${esc(waLink(doneText))}" target="_blank" rel="noopener">Per WhatsApp Bescheid geben</a>
           ${emailjsConfig
@@ -595,6 +619,21 @@ const actions = {
   logout: () => { ls.del(`wichtel:me:${S.gid}`); S.me = null; S.justJoined = false; renderGroup(); },
   'dismiss-fresh': () => { S.fresh = false; renderGroup(); },
   'ask-remove': (el) => { S.confirm = `rm:${el.dataset.mid}`; renderGroup(); },
+  'ask-relink': (el) => { S.confirm = `relink:${el.dataset.mid}`; renderGroup(); },
+  relink: async (el) => {
+    const mid = el.dataset.mid;
+    const m = S.g.members[mid];
+    const { pub, secret } = await newKeyPair();
+    const proxies = ls.get(`wichtel:proxy:${S.gid}`, {});
+    proxies[mid] = secret;
+    ls.set(`wichtel:proxy:${S.gid}`, proxies);
+    S.confirm = null;
+    await store.update(S.gid, { [`members.${mid}.pub`]: pub, [`members.${mid}.relinkedAt`]: Date.now() });
+    const link = personalLink(S.gid, { mid, d: secret });
+    const sent = m.email && await sendMail(m.email, m.name, `Dein neuer Wichtel-Link: ${S.g.name}`,
+      `Hallo ${m.name}\n\nHier ist dein neuer persönlicher Link für „${S.g.name}“ (nicht weitergeben):\n${link}`);
+    toast(sent ? `Neuer Link für ${m.name} ist per E-Mail unterwegs.` : `Neuer Link für ${m.name} erstellt. Schick ihn per WhatsApp oder kopiere ihn.`);
+  },
   'ask-redraw': () => { S.confirm = 'redraw'; renderGroup(); },
   'ask-draw': () => { S.confirm = 'draw-missing'; renderGroup(); },
   'ask-behalf': (el) => { S.confirm = `behalf:${el.dataset.guest}`; renderGroup(); document.getElementById('b-email')?.focus(); },

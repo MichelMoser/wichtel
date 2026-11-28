@@ -158,6 +158,8 @@ details > :not(summary) + :not(summary) { margin-top: .6rem; }
 .roster .behalf input, .roster .behalf textarea { background: var(--paper); }
 .guest-add { display: flex; flex-direction: column; gap: .5rem; }
 .guest-add .btn { align-self: flex-start; }
+.warn-line { background: var(--warn-bg); color: var(--warn-ink); padding: .6rem .8rem; border-radius: 8px; font-size: .92rem; }
+.warn-text { color: var(--accent); }
 .field { display: flex; flex-direction: column; gap: .7rem; }
 .people li.pending { border-style: dashed; color: var(--muted); font-weight: 400; background: transparent; }
 .chips { list-style: none; padding: 0; margin: 0; display: flex; flex-wrap: wrap; gap: .4rem; }
